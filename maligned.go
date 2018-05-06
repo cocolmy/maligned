@@ -2,57 +2,52 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package main
+package maligned
 
 import (
-	"flag"
 	"fmt"
 	"go/ast"
 	"go/build"
 	"go/token"
 	"go/types"
-	"log"
 	"sort"
 	"strings"
 
-	"github.com/kisielk/gotool"
 	"golang.org/x/tools/go/loader"
 )
 
 var fset = token.NewFileSet()
 
-func main() {
-	flagVerbose := flag.Bool("v", false, "verbose: print field order suggestions")
-	flag.Parse()
+type Issue struct {
+	OldSize, NewSize int
+	NewStructDef     string
+	Pos              token.Position
+}
 
-	importPaths := gotool.ImportPaths(flag.Args())
-	if len(importPaths) == 0 {
-		return
-	}
+func Run(prog *loader.Program) []Issue {
+	flagVerbose := true
+	fset = prog.Fset
 
-	var conf loader.Config
-	conf.Fset = fset
-	for _, importPath := range importPaths {
-		conf.Import(importPath)
-	}
-	prog, err := conf.Load()
-	if err != nil {
-		log.Fatal(err)
-	}
+	var issues []Issue
 
 	for _, pkg := range prog.InitialPackages() {
 		for _, file := range pkg.Files {
 			ast.Inspect(file, func(node ast.Node) bool {
 				if s, ok := node.(*ast.StructType); ok {
-					malign(node.Pos(), pkg.Types[s].Type.(*types.Struct), *flagVerbose)
+					i := malign(node.Pos(), pkg.Types[s].Type.(*types.Struct), flagVerbose)
+					if i != nil {
+						issues = append(issues, *i)
+					}
 				}
 				return true
 			})
 		}
 	}
+
+	return issues
 }
 
-func malign(pos token.Pos, str *types.Struct, verbose bool) {
+func malign(pos token.Pos, str *types.Struct, verbose bool) *Issue {
 	wordSize := int64(8)
 	maxAlign := int64(8)
 	switch build.Default.GOARCH {
@@ -66,13 +61,11 @@ func malign(pos token.Pos, str *types.Struct, verbose bool) {
 	sz := s.Sizeof(str)
 	opt, fields := optimalSize(str, &s, verbose)
 	if sz == opt {
-		return
+		return nil
 	}
-	if !verbose {
-		fmt.Printf("%s: struct of size %d could be %d\n", fset.Position(pos), sz, opt)
-		return
-	}
-	fmt.Printf("%s: struct of size %d could be %d with struct{\n", fset.Position(pos), sz, opt)
+
+	newStructDefParts := []string{"struct{"}
+
 	var w int
 	for _, f := range fields {
 		if n := len(f.Name()); n > w {
@@ -81,9 +74,17 @@ func malign(pos token.Pos, str *types.Struct, verbose bool) {
 	}
 	spaces := strings.Repeat(" ", w)
 	for _, f := range fields {
-		fmt.Printf("\t%s%s\t%s,\n", f.Name(), spaces[len(f.Name()):], f.Type().String())
+		line := fmt.Sprintf("\t%s%s\t%s,", f.Name(), spaces[len(f.Name()):], f.Type().String())
+		newStructDefParts = append(newStructDefParts, line)
 	}
-	fmt.Println("}")
+	newStructDefParts = append(newStructDefParts, "}")
+
+	return &Issue{
+		OldSize:      int(sz),
+		NewSize:      int(opt),
+		NewStructDef: strings.Join(newStructDefParts, "\n"),
+		Pos:          fset.Position(pos),
+	}
 }
 
 func optimalSize(str *types.Struct, sizes *gcSizes, stable bool) (int64, []*types.Var) {
